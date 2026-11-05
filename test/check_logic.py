@@ -2,8 +2,6 @@
 from pathlib import Path
 import shutil
 import subprocess
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared/test"))
 from host_stubs import write_wire_stub
 
 project = Path(__file__).resolve().parents[1]
@@ -244,5 +242,5 @@ compiler = shutil.which("g++")
 if not compiler:
     raise SystemExit("g++ is required for host checks")
 exe = out / "check.exe"
-subprocess.run([compiler, "-std=c++17", "-O2", "-Wall", "-Wextra", "-I", str(out), "-I", str(project / "src"), str(out / "check.cpp"), "-o", str(exe)], check=True)
+subprocess.run([compiler, "-std=c++17", "-O2", "-Wall", "-Wextra", "-I", str(out), "-I", str(project / "src"), "-I", str(project / "include"), str(out / "check.cpp"), "-o", str(exe)], check=True)
 subprocess.run([str(exe)], check=True)

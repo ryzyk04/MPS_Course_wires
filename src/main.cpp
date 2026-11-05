@@ -2,8 +2,8 @@
 #include <Adafruit_NeoPixel.h>
 #include <SoftwareSerial.h>
 #include <Wire.h>
-#include "../../shared/uart_protocol.h"
-#include "../../shared/module_bus.h"
+#include "uart_protocol.h"
+#include "module_bus.h"
 
 // Uno: WS2812B (8 шт.) DIN -> D8; питание 5V, общий GND.
 // Провода слева направо: D3..D7 -> разрываемый провод -> GND.
