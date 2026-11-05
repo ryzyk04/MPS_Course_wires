@@ -2,10 +2,14 @@
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared/test"))
+from host_stubs import write_wire_stub
 
 project = Path(__file__).resolve().parents[1]
 out = project / ".pio" / "host-checks"
 out.mkdir(parents=True, exist_ok=True)
+write_wire_stub(out)
 (out / "Arduino.h").write_text(r'''
 #pragma once
 #include <cstdint>
@@ -56,6 +60,7 @@ struct SoftwareSerial {
   int available() {return int(rx.size());}
   int read() {char c=rx[0];rx.erase(0,1);return static_cast<unsigned char>(c);}
   void print(const char *s) {tx+=s;}
+  void print(char c) {tx+=c;}
   void print(uint32_t n) {tx+=std::to_string(n);}
   void write(char c) {tx+=c;}
   void println() {tx+='\n';}

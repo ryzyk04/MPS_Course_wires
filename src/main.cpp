@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <SoftwareSerial.h>
+#include <Wire.h>
 #include "../../shared/uart_protocol.h"
+#include "../../shared/module_bus.h"
 
 // Uno: WS2812B (8 шт.) DIN -> D8; питание 5V, общий GND.
 // Провода слева направо: D3..D7 -> разрываемый провод -> GND.
@@ -60,6 +62,88 @@ bool pendingVictory = false;
 uint32_t resultSentAt = 0;
 void beginNewPuzzle(uint16_t seed, Difficulty level);
 
+// Temporary 5 V I2C gateway. A4=SDA, A5=SCL, 100 kHz.
+struct GatewayNode {
+  uint8_t address, type, failures;
+  bool online, ready, solved, resultAcked;
+  uint16_t errors, ackedErrors;
+  uint32_t errorSentAt, solvedSentAt;
+};
+GatewayNode nodes[2] = {
+  {ModuleBus::SIMON_ADDRESS, ModuleBus::SIMON, 0, false, false, false, false, 0, 0, 0, 0},
+  {ModuleBus::LABYRINTH_ADDRESS, ModuleBus::LABYRINTH, 0, false, false, false, false, 0, 0, 0, 0}
+};
+uint32_t lastBusPoll = 0;
+uint8_t nextBusNode = 0;
+
+void sendGatewayEvent(const GatewayNode &node, const char *event, uint64_t round, uint16_t value) {
+  espLink.print(F("G:")); espLink.print(uint32_t(node.type)); espLink.print(':');
+  espLink.print(event); espLink.print(':'); uartPrintId(espLink, round);
+  espLink.print(':'); espLink.println(uint32_t(value));
+}
+
+void writeGatewayCommand(const GatewayNode &node, uint8_t operation) {
+  ModuleBus::Frame frame;
+  frame.type = node.type; frame.operation = operation;
+  frame.round = lastGenerationId; frame.seed = gameSeed; frame.difficulty = gameDifficulty;
+  uint8_t packet[ModuleBus::FRAME_SIZE]; ModuleBus::encode(frame, packet);
+  Wire.beginTransmission(node.address); Wire.write(packet, sizeof(packet)); Wire.endTransmission();
+}
+
+void resetGatewayRound() {
+  for (auto &node : nodes) {
+    node.ready = node.solved = node.resultAcked = false;
+    node.errors = node.ackedErrors = 0;
+    node.errorSentAt = node.solvedSentAt = 0;
+    if (node.online) writeGatewayCommand(node, ModuleBus::GENERATE);
+  }
+}
+
+void updateGateway(uint32_t now) {
+  if (now - lastBusPoll >= 25) {
+    lastBusPoll = now;
+    GatewayNode &node = nodes[nextBusNode]; nextBusNode ^= 1;
+    uint8_t packet[ModuleBus::FRAME_SIZE], n = 0;
+    Wire.requestFrom(node.address, uint8_t(sizeof(packet)));
+    while (Wire.available()) {
+      uint8_t value = Wire.read(); if (n < sizeof(packet)) packet[n++] = value;
+    }
+    ModuleBus::Frame frame;
+    bool valid = ModuleBus::decode(packet, n, frame) && frame.operation == ModuleBus::STATUS && frame.type == node.type;
+    if (!valid) {
+      if (node.failures < 3) ++node.failures;
+      if (node.failures == 3 && node.online) {
+        node.online = false;
+        sendGatewayEvent(node, "OFFLINE", lastGenerationId, 0);
+      }
+    } else {
+      node.failures = 0;
+      if (!node.online) { node.online = true; sendGatewayEvent(node, "ONLINE", frame.round, 0); }
+      if (lastGenerationId) {
+        if (frame.round != lastGenerationId || frame.seed != gameSeed || frame.difficulty != gameDifficulty) {
+          node.ready = false;
+          writeGatewayCommand(node, ModuleBus::GENERATE);
+        } else {
+          if (!node.ready) { node.ready = true; sendGatewayEvent(node, "READY", frame.round, 0); }
+          if (frame.errors > node.errors) { node.errors = frame.errors; node.errorSentAt = now - UART_RETRY_MS; }
+          bool solvedNow = frame.state == ModuleBus::SOLVED;
+          if (solvedNow && !node.solved) node.solvedSentAt = now - UART_RETRY_MS;
+          node.solved = solvedNow;
+        }
+      }
+    }
+  }
+  if (!lastGenerationId) return;
+  for (auto &node : nodes) {
+    if (node.errors > node.ackedErrors && now - node.errorSentAt >= UART_RETRY_MS) {
+      sendGatewayEvent(node, "ERROR", lastGenerationId, node.errors); node.errorSentAt = now;
+    }
+    if (node.solved && !node.resultAcked && now - node.solvedSentAt >= UART_RETRY_MS) {
+      sendGatewayEvent(node, "SOLVED", lastGenerationId, 0); node.solvedSentAt = now;
+    }
+  }
+}
+
 void sendResultEvent(uint32_t now) {
   espLink.print(pendingVictory ? F("W:SOLVED:") : F("W:FAILED:"));
   uartPrintId(espLink, pendingResultId);
@@ -86,7 +170,13 @@ void handleEspLine(const char *line) {
   uint64_t resultAck;
   uint16_t seed;
   uint8_t level;
-  if (uartParseId(line, "E:ACK:", id)) {
+  uint8_t module; char event[8]; uint64_t round; uint16_t count;
+  if (ModuleBus::parseEvent(line, module, event, round, count, "E:GACK:")) {
+    if (round == lastGenerationId) for (auto &node : nodes) if (node.type == module) {
+      if (!strcmp(event,"ERROR") && count <= node.errors && count > node.ackedErrors) node.ackedErrors = count;
+      if (!strcmp(event,"SOLVED")) node.resultAcked = true;
+    }
+  } else if (uartParseId(line, "E:ACK:", id)) {
     if (id == pendingButtonId) {
       pendingButtonId = 0;
       Serial.print(F("UART: ESP подтвердил #"));
@@ -101,6 +191,7 @@ void handleEspLine(const char *line) {
     if (generationId != lastGenerationId) {
       beginNewPuzzle(seed, static_cast<Difficulty>(level));
       lastGenerationId = generationId;
+      resetGatewayRound();
     }
     // Echo validated decimal digits: AVR Print has no uint64_t overload.
     espLink.print(F("W:GENERATED:"));
@@ -400,6 +491,7 @@ void scanWires(uint32_t now) {
 
 void setup() {
   Serial.begin(115200);
+  Wire.begin(); Wire.setClock(100000); Wire.setWireTimeout(2500, true);
   espLink.begin(UART_BAUD);
   Serial.println(F("UART WIRES v1: RX=D10 TX=D11 9600; кнопка=D9"));
   pinMode(PIN_BUTTON, INPUT_PULLUP);
@@ -428,6 +520,7 @@ void loop() {
   updateEspLink(now);
   scanButton(now);
   scanWires(now);
+  updateGateway(now);
   if (state == WAITING_FOR_COMMAND) return;  // Кнопка и UART работают и без задачи.
   if (state == SOLVED) setStatus(GREEN);
   else if (state == FAILED) setStatus(RED);
