@@ -100,8 +100,11 @@ void resetGatewayRound() {
 }
 
 void updateGateway(uint32_t now) {
+  // Log the first response and subsequent changes, including nodes never seen online.
+  static uint8_t previousDiagnostic[2] = {255, 255};
   if (now - lastBusPoll >= 25) {
     lastBusPoll = now;
+    uint8_t nodeIndex = nextBusNode;
     GatewayNode &node = nodes[nextBusNode]; nextBusNode ^= 1;
     uint8_t packet[ModuleBus::FRAME_SIZE], n = 0;
     Wire.requestFrom(node.address, uint8_t(sizeof(packet)));
@@ -109,7 +112,18 @@ void updateGateway(uint32_t now) {
       uint8_t value = Wire.read(); if (n < sizeof(packet)) packet[n++] = value;
     }
     ModuleBus::Frame frame;
-    bool valid = ModuleBus::decode(packet, n, frame) && frame.operation == ModuleBus::STATUS && frame.type == node.type;
+    bool decoded = ModuleBus::decode(packet, n, frame);
+    bool valid = decoded && frame.operation == ModuleBus::STATUS && frame.type == node.type;
+    uint8_t diagnostic = !n ? 1 : !decoded ? 2 : !valid ? 3 : 0;
+    if (previousDiagnostic[nodeIndex] != diagnostic) {
+      previousDiagnostic[nodeIndex] = diagnostic;
+      Serial.print(node.type == ModuleBus::SIMON ? F("I2C Simon 0x11: ") : F("I2C Labyrinth 0x12: "));
+      if (valid) Serial.println(F("OK, valid STATUS"));
+      else if (!n) Serial.println(F("NO RESPONSE; check power, GND, SDA=A4, SCL=A5, pull-ups"));
+      else if (!decoded) {
+        Serial.print(F("INVALID FRAME; received bytes=")); Serial.println(n);
+      } else Serial.println(F("WRONG MODULE OR OPERATION; check firmware/address"));
+    }
     if (!valid) {
       if (node.failures < 3) ++node.failures;
       if (node.failures == 3 && node.online) {
@@ -494,6 +508,7 @@ void setup() {
   Wire.begin(); Wire.setClock(100000); Wire.setWireTimeout(2500, true);
   espLink.begin(UART_BAUD);
   Serial.println(F("UART WIRES v1: RX=D10 TX=D11 9600; кнопка=D9"));
+  Serial.println(F("I2C GATEWAY: SDA=A4 SCL=A5; Simon=0x11 Labyrinth=0x12"));
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   buttonRaw = buttonStable = digitalRead(PIN_BUTTON) == LOW;
   buttonChangedAt = millis();
