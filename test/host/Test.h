@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include <stdexcept>
 #include <string>
 #include <iostream>

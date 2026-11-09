@@ -44,11 +44,13 @@ bool takeReceiveFault()
 bool writeTwi(uint8_t address, const uint8_t *data, uint8_t size)
 {
     Mock::writes[address] = {data, data + size};
+    if (Mock::writeHook) { return Mock::writeHook(address, data, size); }
     return true;
 }
 
 bool readTwi(uint8_t address, uint8_t *data, uint8_t size)
 {
+    if (Mock::readHook) { return Mock::readHook(address, data, size); }
     const auto found = Mock::replies.find(address);
     if (found == Mock::replies.end() || found->second.size() != size) {
         return false;

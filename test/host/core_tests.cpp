@@ -11,9 +11,11 @@
 #include "communication/EspLink.h"
 #include "communication/Text.h"
 #include "drivers/Ring.h"
-#include "module_bus.h"
+#include "TestBus.h"
 
 using namespace Wires;
+
+void sharedTests();
 
 namespace {
 
@@ -334,7 +336,8 @@ void busTests()
         fixture.link.update(1500, 0, false);
         CHECK(Mock::output.empty());
         fixture.link.report(Result::Failed, 1501);
-        CHECK(Mock::output == "W:FAILED:501\n");
+        CHECK(Mock::output.empty());
+        CHECK(fixture.link.status().state == PuzzleBus::State::Solved);
         fixture.command("E:GENERATE:502:0:2", 1502);
         Mock::output.clear();
         fixture.link.update(3000, 0, false);
@@ -343,32 +346,34 @@ void busTests()
 
     run("gateway discovery relay cumulative errors ACK solved and disconnection", [] {
         Fixture fixture;
-        ModuleBus::Frame status;
-        status.type = ModuleBus::SIMON;
-        uint8_t packet[ModuleBus::FRAME_SIZE];
-        ModuleBus::encode(status, packet);
+        TestBus::Frame status;
+        status.type = TestBus::SIMON;
+        uint8_t packet[TestBus::FRAME_SIZE];
+        TestBus::encode(status, packet);
         Mock::replies[0x11] = {packet, packet + sizeof(packet)};
         fixture.gateway.update(25);
         CHECK(Mock::output == "G:2:ONLINE:0:0\n");
 
         fixture.command("E:GENERATE:4294967297:42:2", 30);
+        fixture.gateway.update(50);
+        fixture.gateway.update(75);
         CHECK(Mock::writes.count(0x11) == 1);
-        ModuleBus::Frame generate;
+        TestBus::Frame generate;
         const auto &sent = Mock::writes[0x11];
-        CHECK(ModuleBus::decode(sent.data(), sent.size(), generate));
+        CHECK(TestBus::decode(sent.data(), sent.size(), generate));
         CHECK(generate.round == 4294967297ULL);
-        CHECK(generate.operation == ModuleBus::GENERATE);
+        CHECK(generate.operation == TestBus::GENERATE);
 
         status.round = 4294967297ULL;
         status.seed = 42;
         status.difficulty = 2;
-        status.state = ModuleBus::PLAYING;
+        status.state = TestBus::PLAYING;
         status.errors = 3;
-        ModuleBus::encode(status, packet);
+        TestBus::encode(status, packet);
         Mock::replies[0x11] = {packet, packet + sizeof(packet)};
         Mock::output.clear();
-        fixture.gateway.update(50);
-        fixture.gateway.update(75);
+        fixture.gateway.update(100);
+        fixture.gateway.update(125);
         CHECK(Mock::output.find("G:2:READY:4294967297:0\n") != std::string::npos);
         CHECK(Mock::output.find("G:2:ERROR:4294967297:3\n") != std::string::npos);
         fixture.command("E:GACK:2:ERROR:4294967297:3", 80);
@@ -376,8 +381,8 @@ void busTests()
         fixture.gateway.update(575);
         CHECK(Mock::output.find("ERROR") == std::string::npos);
 
-        status.state = ModuleBus::SOLVED;
-        ModuleBus::encode(status, packet);
+        status.state = TestBus::SOLVED;
+        TestBus::encode(status, packet);
         Mock::replies[0x11] = {packet, packet + sizeof(packet)};
         fixture.gateway.update(600);
         CHECK(Mock::output.find("G:2:SOLVED:4294967297:0\n") != std::string::npos);
@@ -391,23 +396,23 @@ void busTests()
         CHECK(Mock::output.find("SOLVED") == std::string::npos);
     });
 
-    run("legacy frame CRC bit corruption and exact size", [] {
-        ModuleBus::Frame frame;
-        frame.type = ModuleBus::LABYRINTH;
-        frame.operation = ModuleBus::GENERATE;
+    run("shared frame CRC bit corruption and exact size", [] {
+        TestBus::Frame frame;
+        frame.type = TestBus::LABYRINTH;
+        frame.operation = TestBus::GENERATE;
         frame.round = UINT64_MAX;
         frame.seed = 9999;
         frame.difficulty = 2;
-        uint8_t packet[ModuleBus::FRAME_SIZE];
-        ModuleBus::encode(frame, packet);
-        ModuleBus::Frame decoded;
-        CHECK(ModuleBus::decode(packet, sizeof(packet), decoded));
+        uint8_t packet[TestBus::FRAME_SIZE];
+        TestBus::encode(frame, packet);
+        TestBus::Frame decoded;
+        CHECK(TestBus::decode(packet, sizeof(packet), decoded));
         CHECK(decoded.round == UINT64_MAX);
-        CHECK(!ModuleBus::decode(packet, sizeof(packet) - 1, decoded));
+        CHECK(!TestBus::decode(packet, sizeof(packet) - 1, decoded));
         for (uint8_t byte = 0; byte < sizeof(packet); ++byte) {
             for (uint8_t bit = 0; bit < 8; ++bit) {
                 packet[byte] ^= uint8_t(1U << bit);
-                CHECK(!ModuleBus::decode(packet, sizeof(packet), decoded));
+                CHECK(!TestBus::decode(packet, sizeof(packet), decoded));
                 packet[byte] ^= uint8_t(1U << bit);
             }
         }
@@ -457,7 +462,7 @@ int main(int argc, char **argv)
     try {
         const std::string group = argc > 1 ? argv[1] : "all";
         if (group == "all" || group == "logic") { logicTests(); }
-        if (group == "all" || group == "bus") { busTests(); }
+        if (group == "all" || group == "bus") { busTests(); sharedTests(); }
         std::cout << "Passed " << cases << " groups, " << checks << " checks\n";
         return 0;
     } catch (const std::exception &error) {

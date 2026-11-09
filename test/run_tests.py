@@ -18,19 +18,23 @@ def main(arguments=None):
     if not compiler:
         parser.error("g++ is required")
 
+    library = root.parent / "puzzle_bus"
     common = ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
               "-I", str(root / "include"), "-I", str(root / "test" / "host")]
+
+    common += ["-I", str(library / "include")]
 
     def build_and_run(name, sources, extra_flags=(), run_arguments=()):
         executable = out / (name + (".exe" if sys.platform == "win32" else ""))
         subprocess.run([compiler, *common, *extra_flags,
                         *[str(root / source) for source in sources],
+                        *[str(library / "src/core" / name) for name in ("Protocol.cpp", "Node.cpp", "Master.cpp")],
                         "-o", str(executable)], check=True, timeout=120)
         subprocess.run([str(executable), *run_arguments], check=True, timeout=120)
 
     if options.group != "hardware":
         sources = [
-            "test/host/core_tests.cpp", "test/host/MockBoard.cpp",
+            "test/host/core_tests.cpp", "test/host/MockBoard.cpp", "test/host/shared_tests.cpp",
             "src/game/Puzzle.cpp", "src/game/Rules.cpp", "src/game/Game.cpp",
             "src/game/Display.cpp", "src/communication/Text.cpp",
             "src/communication/Gateway.cpp", "src/communication/EspLink.cpp",

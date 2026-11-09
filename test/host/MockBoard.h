@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <stdint.h>
+#include <functional>
 
 namespace Mock {
 inline std::deque<uint8_t> input;
@@ -16,6 +17,8 @@ inline std::map<uint8_t, std::vector<uint8_t>> writes;
 inline std::vector<uint8_t> pixels;
 inline bool showSuccess = true;
 inline unsigned showCalls = 0;
+inline std::function<bool(uint8_t, const uint8_t *, uint8_t)> writeHook;
+inline std::function<bool(uint8_t, uint8_t *, uint8_t)> readHook;
 
 inline void reset()
 {
@@ -28,6 +31,8 @@ inline void reset()
     id = 100;
     showCalls = 0;
     showSuccess = true;
+    writeHook = {};
+    readHook = {};
 }
 
 inline void inject(const std::string &line)
