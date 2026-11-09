@@ -1,7 +1,6 @@
 #include "communication/EspLink.h"
 #include "communication/Text.h"
 #include "drivers/Board.h"
-#include "module_bus.h"
 #include "Config.h"
 
 #include <string.h>
@@ -31,9 +30,13 @@ void EspLink::sendResult(uint32_t now)
 
 void EspLink::report(Result result, uint32_t now)
 {
-    if (!round_ || result == Result::None) {
+    if (!round_ || result == Result::None || node_.status().state != PuzzleBus::State::Playing) {
         return;
     }
+    if (result == Result::Failed) {
+        node_.bigError();
+    }
+    node_.finish(result == Result::Solved);
     pendingResult_ = round_;
     victory_ = result == Result::Solved;
     sendResult(now);
@@ -69,7 +72,7 @@ void EspLink::handle(const char *line, uint32_t now, uint8_t openMask)
     uint64_t eventRound;
     uint16_t count;
 
-    if (ModuleBus::parseEvent(line, type, event, eventRound, count, "E:GACK:")) {
+    if (PuzzleBus::GatewayUart::parseEvent(line, type, event, eventRound, count, "E:GACK:")) {
         gateway_.acknowledge(type, event, eventRound, count);
     } else if (uartParseId(line, "E:ACK:", buttonId)) {
         if (pendingButton_ == buttonId) {
@@ -80,10 +83,24 @@ void EspLink::handle(const char *line, uint32_t now, uint8_t openMask)
             pendingResult_ = 0;
         }
     } else if (uartParseGeneration(line, generation, seed, level)) {
+        PuzzleBus::Frame frame;
+        frame.operation = PuzzleBus::Operation::Generate;
+        frame.status.type = PuzzleBus::PuzzleType::Wires;
+        frame.status.round.id = generation;
+        frame.status.round.seed = seed;
+        frame.status.round.difficulty = level;
+        if (!node_.receive(frame)) {
+            return;
+        }
         if (generation != round_) {
+            PuzzleBus::Command command;
+            if (!node_.takeCommand(command)) {
+                return;
+            }
             if (!game_.start(seed, static_cast<Difficulty>(level), now, openMask)) {
                 return;
             }
+            node_.ready();
             round_ = generation;
             pendingResult_ = 0;
             gateway_.start(round_, seed, static_cast<Difficulty>(level));

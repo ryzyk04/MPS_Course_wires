@@ -1,24 +1,29 @@
 #pragma once
 
-#include <stdint.h>
+#include <PuzzleBus/Master.h>
 #include "game/Puzzle.h"
 
 namespace Wires {
 
-// Временный мост существующего 20-байтового протокола в UART ESP32.
+// Мост общего PuzzleMaster в существующий UART мастера ESP32.
 class Gateway {
 public:
+    Gateway();
     void start(uint64_t round, uint16_t seed, Difficulty difficulty);
     void update(uint32_t now);
     void acknowledge(uint8_t type, const char *event, uint64_t round, uint16_t count);
 
 private:
+    class Transport : public PuzzleBus::Transport {
+    public:
+        bool write(uint8_t address, const uint8_t *data, size_t size) override;
+        size_t read(uint8_t address, uint8_t *data, size_t capacity) override;
+    };
+
     struct Node {
         uint8_t address;
         uint8_t type;
-        uint8_t failures = 0;
-        uint8_t diagnostic = 255;
-        bool online = false;
+        bool scheduled = false;
         bool ready = false;
         bool solved = false;
         bool resultAcked = false;
@@ -31,15 +36,16 @@ private:
             : address(busAddress), type(puzzleType) {}
     };
 
+    Transport transport_;
+    PuzzleBus::PuzzleMaster master_;
     Node nodes_[2] = {Node(0x11, 2), Node(0x12, 3)};
-    uint64_t round_ = 0;
-    uint16_t seed_ = 0;
-    Difficulty difficulty_ = EASY;
+    PuzzleBus::RoundConfig round_;
+    uint32_t now_ = 0;
     uint32_t lastPoll_ = 0;
-    uint8_t nextNode_ = 0;
 
-    void poll(Node &node, uint32_t now);
-    void generate(const Node &node);
+    static void onEvent(const PuzzleBus::Event &event, void *context);
+    void accept(const PuzzleBus::Event &event);
+    void synchronize();
     void send(const Node &node, const char *event, uint16_t count, uint64_t round);
 };
 

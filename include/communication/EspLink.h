@@ -2,7 +2,8 @@
 
 #include "game/Game.h"
 #include "Gateway.h"
-#include "uart_protocol.h"
+#include <PuzzleBus/UartProtocol.h>
+#include <PuzzleBus/Node.h>
 
 namespace Wires {
 
@@ -23,9 +24,12 @@ public:
         return round_;
     }
 
+    const PuzzleBus::Status &status() const { return node_.status(); }
+
 private:
     Game &game_;
     Gateway &gateway_;
+    PuzzleBus::PuzzleNode node_{PuzzleBus::PuzzleType::Wires};
     UartLineReader reader_;
     uint64_t round_ = 0;
     uint64_t pendingResult_ = 0;

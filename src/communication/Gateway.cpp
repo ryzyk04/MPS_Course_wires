@@ -1,12 +1,53 @@
 #include "communication/Gateway.h"
 #include "communication/Text.h"
 #include "drivers/Board.h"
-#include "module_bus.h"
 #include "Config.h"
 
 #include <string.h>
 
 namespace Wires {
+namespace {
+
+PuzzleBus::MasterConfig masterConfig()
+{
+    PuzzleBus::MasterConfig config;
+    // Внешний планировщик сохраняет один адрес каждые BUS_POLL_MS.
+    config.pollIntervalMs = 0;
+    config.failuresBeforeOffline = Config::BUS_FAILURE_LIMIT;
+    return config;
+}
+
+} // namespace
+
+Gateway::Gateway() : master_(transport_, masterConfig())
+{
+    for (const Node &node : nodes_) {
+        master_.addModule(node.address);
+    }
+    master_.setEventHandler(onEvent, this);
+}
+
+bool Gateway::Transport::write(uint8_t address, const uint8_t *data, size_t size)
+{
+    return size == PuzzleBus::FRAME_SIZE && Hardware::writeTwi(address, data, uint8_t(size));
+}
+
+size_t Gateway::Transport::read(uint8_t address, uint8_t *data, size_t capacity)
+{
+    if (capacity < PuzzleBus::FRAME_SIZE ||
+        !Hardware::readTwi(address, data, PuzzleBus::FRAME_SIZE)) {
+        return 0;
+    }
+
+    PuzzleBus::Frame frame;
+    const uint8_t expected = address == 0x11 ? 2 : 3;
+    // Эти адреса закреплены за конкретными платами. Не запускаем другой тип.
+    if (PuzzleBus::decode(data, PuzzleBus::FRAME_SIZE, frame) != PuzzleBus::DecodeResult::Ok ||
+        uint8_t(frame.status.type) != expected) {
+        return 0;
+    }
+    return PuzzleBus::FRAME_SIZE;
+}
 
 void Gateway::send(const Node &node, const char *event, uint16_t count, uint64_t round)
 {
@@ -15,42 +56,93 @@ void Gateway::send(const Node &node, const char *event, uint16_t count, uint64_t
         .append(":").number(round).append(":").number(count).line());
 }
 
-void Gateway::generate(const Node &node)
-{
-    ModuleBus::Frame frame;
-    frame.type = node.type;
-    frame.operation = ModuleBus::GENERATE;
-    frame.round = round_;
-    frame.seed = seed_;
-    frame.difficulty = difficulty_;
-    uint8_t packet[ModuleBus::FRAME_SIZE];
-    ModuleBus::encode(frame, packet);
-    Hardware::writeTwi(node.address, packet, sizeof(packet));
-}
-
 void Gateway::start(uint64_t round, uint16_t seed, Difficulty difficulty)
 {
-    round_ = round;
-    seed_ = seed;
-    difficulty_ = difficulty;
+    PuzzleBus::RoundConfig requested;
+    requested.id = round;
+    requested.seed = seed;
+    requested.difficulty = difficulty;
+    if (!PuzzleBus::validRound(requested) || requested.id <= round_.id) {
+        return;
+    }
 
+    round_ = requested;
     for (Node &node : nodes_) {
-        node.ready = false;
-        node.solved = false;
-        node.resultAcked = false;
-        node.errors = 0;
-        node.ackedErrors = 0;
-        node.errorSentAt = 0;
-        node.solvedSentAt = 0;
-        if (node.online) {
-            generate(node);
+        node.scheduled = false;
+        node.ready = node.solved = node.resultAcked = false;
+        node.errors = node.ackedErrors = 0;
+        node.errorSentAt = node.solvedSentAt = 0;
+    }
+    synchronize();
+}
+
+void Gateway::synchronize()
+{
+    if (!round_.id) {
+        return;
+    }
+
+    // Команды ставятся только после update(), не внутри callback библиотеки.
+    for (Node &node : nodes_) {
+        const PuzzleBus::Module *module = master_.module(node.address);
+        if (!module || !module->online) {
+            continue;
         }
+        const bool matches = PuzzleBus::sameRound(module->status.round, round_);
+        if (!matches) {
+            node.ready = false;
+        }
+        if (!node.scheduled || (!matches && !master_.commandPending(node.address))) {
+            node.scheduled = master_.start(node.address, round_);
+        }
+    }
+}
+
+void Gateway::onEvent(const PuzzleBus::Event &event, void *context)
+{
+    static_cast<Gateway *>(context)->accept(event);
+}
+
+void Gateway::accept(const PuzzleBus::Event &event)
+{
+    for (Node &node : nodes_) {
+        if (node.address != event.module.address) {
+            continue;
+        }
+
+        if (event.kind == PuzzleBus::EventKind::Online) {
+            send(node, "ONLINE", 0, event.module.status.round.id);
+        } else if (event.kind == PuzzleBus::EventKind::Offline) {
+            node.ready = false;
+            send(node, "OFFLINE", 0, round_.id);
+        }
+
+        if (!round_.id || !PuzzleBus::sameRound(event.module.status.round, round_)) {
+            return;
+        }
+        if (event.kind == PuzzleBus::EventKind::StatusReceived &&
+            event.module.status.state != PuzzleBus::State::Waiting &&
+            event.module.status.state != PuzzleBus::State::Preparing && !node.ready) {
+            node.ready = true;
+            send(node, "READY", 0, round_.id);
+        }
+        if (event.kind == PuzzleBus::EventKind::SmallErrors &&
+            event.module.status.smallErrors > node.errors) {
+            node.errors = event.module.status.smallErrors;
+            node.errorSentAt = now_ - Config::UART_RETRY_MS;
+        }
+        if (event.kind == PuzzleBus::EventKind::Completed &&
+            event.module.status.state == PuzzleBus::State::Solved) {
+            node.solved = true;
+            node.solvedSentAt = now_ - Config::UART_RETRY_MS;
+        }
+        return;
     }
 }
 
 void Gateway::acknowledge(uint8_t type, const char *event, uint64_t round, uint16_t count)
 {
-    if (round != round_) {
+    if (!event || round != round_.id) {
         return;
     }
 
@@ -61,92 +153,33 @@ void Gateway::acknowledge(uint8_t type, const char *event, uint64_t round, uint1
         if (!strcmp(event, "ERROR") && count <= node.errors && count > node.ackedErrors) {
             node.ackedErrors = count;
         }
-        if (!strcmp(event, "SOLVED")) {
+        if (!strcmp(event, "SOLVED") && node.solved) {
             node.resultAcked = true;
         }
     }
 }
 
-void Gateway::poll(Node &node, uint32_t now)
-{
-    uint8_t packet[ModuleBus::FRAME_SIZE];
-    const bool received = Hardware::readTwi(node.address, packet, sizeof(packet));
-    ModuleBus::Frame frame;
-    const bool decoded = received && ModuleBus::decode(packet, sizeof(packet), frame);
-    const bool valid = decoded && frame.operation == ModuleBus::STATUS && frame.type == node.type;
-    const uint8_t diagnostic = !received ? 1 : !decoded ? 2 : !valid ? 3 : 0;
-
-    if (diagnostic != node.diagnostic) {
-        node.diagnostic = diagnostic;
-        const Hardware::Diagnostic messages[] = {
-            Hardware::Diagnostic::NodeOk, Hardware::Diagnostic::NodeMissing,
-            Hardware::Diagnostic::NodeInvalid, Hardware::Diagnostic::NodeWrong
-        };
-        Hardware::debug(messages[diagnostic], node.type);
-    }
-
-    if (!valid) {
-        if (node.failures < Config::BUS_FAILURE_LIMIT) {
-            ++node.failures;
-        }
-        if (node.online && node.failures >= Config::BUS_FAILURE_LIMIT) {
-            node.online = false;
-            send(node, "OFFLINE", 0, round_);
-        }
-        return;
-    }
-
-    node.failures = 0;
-    if (!node.online) {
-        node.online = true;
-        send(node, "ONLINE", 0, frame.round);
-    }
-
-    if (!round_) {
-        return;
-    }
-    if (frame.round != round_ || frame.seed != seed_ || frame.difficulty != difficulty_) {
-        node.ready = false;
-        generate(node);
-        return;
-    }
-
-    if (!node.ready) {
-        node.ready = true;
-        send(node, "READY", 0, frame.round);
-    }
-    if (frame.errors > node.errors) {
-        node.errors = frame.errors;
-        node.errorSentAt = now - Config::UART_RETRY_MS;
-    }
-
-    const bool solved = frame.state == ModuleBus::SOLVED;
-    if (solved && !node.solved) {
-        node.solvedSentAt = now - Config::UART_RETRY_MS;
-    }
-    node.solved = solved;
-}
-
 void Gateway::update(uint32_t now)
 {
+    now_ = now;
     if (uint32_t(now - lastPoll_) >= Config::BUS_POLL_MS) {
         lastPoll_ = now;
-        poll(nodes_[nextNode_], now);
-        nextNode_ ^= 1;
+        master_.update(now);
+        synchronize();
     }
 
-    if (!round_) {
+    if (!round_.id) {
         return;
     }
     for (Node &node : nodes_) {
         if (node.errors > node.ackedErrors &&
             uint32_t(now - node.errorSentAt) >= Config::UART_RETRY_MS) {
-            send(node, "ERROR", node.errors, round_);
+            send(node, "ERROR", node.errors, round_.id);
             node.errorSentAt = now;
         }
         if (node.solved && !node.resultAcked &&
             uint32_t(now - node.solvedSentAt) >= Config::UART_RETRY_MS) {
-            send(node, "SOLVED", 0, round_);
+            send(node, "SOLVED", 0, round_.id);
             node.solvedSentAt = now;
         }
     }
